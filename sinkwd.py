@@ -7,30 +7,53 @@ import subprocess
 import urllib.request
 from urllib.error import HTTPError
 
-try:
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.prompt import Prompt
-    from rich.markdown import Markdown
-    from rich.live import Live
-except ImportError:
-    os.system("pip3 install rich --break-system-packages || pip3 install rich")
-    print("Dependencies installed. Please run 'sinkwd' again.")
-    sys.exit(0)
+# ─── Auto-install dependencies if missing ───
+def ensure_deps():
+    try:
+        import textual
+        import rich
+    except ImportError:
+        print("📦 Installing dependencies...")
+        os.system("pip3 install textual rich --break-system-packages 2>/dev/null || pip3 install textual rich --user 2>/dev/null || pip3 install textual rich")
+        print("✅ Done! Please run 'sinkwd' again.")
+        sys.exit(0)
 
-console = Console()
+ensure_deps()
+
+from textual.app import App, ComposeResult
+from textual.containers import VerticalScroll, Container, Horizontal
+from textual.widgets import Input, Static, Header, Footer, Label, Button
+from textual.binding import Binding
+from textual.reactive import reactive
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.syntax import Syntax
+from rich.panel import Panel
+from rich.text import Text
+
 CONFIG_PATH = os.path.expanduser("~/.sinket_config.json")
 HISTORY_PATH = os.path.expanduser("~/.sinket_history.json")
 REPO_DIR = os.path.expanduser("~/.sinket_clawd")
 
-ASCII_ART = """[bold cyan]
-███████╗██╗███╗   ██╗██╗  ██╗███████╗████████╗
-██╔════╝██║████╗  ██║██║ ██╔╝██╔════╝╚══██╔══╝
-███████╗██║██╔██╗ ██║█████╔╝ █████╗     ██║   
-╚════██║██║██║╚██╗██║██╔═██╗ ██╔══╝     ██║   
-███████║██║██║ ╚████║██║  ██╗███████╗   ██║   
-╚══════╝╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝   ╚═╝   
-[/bold cyan]"""
+ZEN_CSS = """
+Screen { align: center middle; }
+.main-container { width: 100%; height: 100%; background: #0d1117; }
+.chat-scroll { width: 100%; height: 1fr; background: #0d1117; padding: 0 1; }
+.message-user { width: 100%; height: auto; margin: 1 0; }
+.message-ai { width: 100%; height: auto; margin: 1 0; }
+.user-bubble { background: #161b22; color: #39c5cf; padding: 1 2; border-left: thick #39c5cf; }
+.ai-bubble { background: #161b22; color: #c9d1d9; padding: 1 2; border-left: thick #238636; }
+.thinking-bubble { background: #161b22; color: #39c5cf; padding: 1 2; border-left: thick #39c5cf; text-style: italic; }
+.input-row { height: auto; background: #161b22; padding: 0 1; }
+Input { background: #0d1117; color: #39c5cf; border: none; padding: 1 2; }
+Input:focus { border: none; }
+.status-bar { height: 1; background: #161b22; color: #8b949e; padding: 0 2; }
+.setup-modal { background: #161b22; color: #c9d1d9; border: thick #39c5cf; padding: 2 4; width: 60; height: auto; }
+.setup-modal Input { background: #0d1117; border: tall #30363d; margin: 1 0; }
+.setup-modal Button { background: #238636; color: white; margin: 1 0; }
+.setup-modal Button:hover { background: #2ea043; }
+.title-bar { height: 1; background: #161b22; color: #39c5cf; content-align: center middle; text-style: bold; }
+"""
 
 def load_config():
     if os.path.exists(CONFIG_PATH):
@@ -50,155 +73,210 @@ def load_history():
 
 def save_history(history):
     with open(HISTORY_PATH, "w") as f:
-        json.dump(history, f)
+        json.dump(history[-100:], f)  # Keep last 100 only
 
-def setup_provider(is_reconfigure=False):
-    console.clear()
-    console.print(ASCII_ART, justify="center")
-    console.print(Panel("[bold cyan]SETUP[/bold cyan]\n[dim]Configure API Provider.[/dim]", border_style="cyan"))
+class SetupModal(Container):
+    def compose(self) -> ComposeResult:
+        yield Label("⚙️  API Provider Setup", classes="title-bar")
+        yield Label("Base URL:", id="lbl-url")
+        yield Input(placeholder="https://api.openai.com/v1", id="base_url")
+        yield Label("Model Name:", id="lbl-model")
+        yield Input(placeholder="gpt-4", id="model")
+        yield Label("API Key:", id="lbl-key")
+        yield Input(placeholder="sk-...", id="token", password=True)
+        with Horizontal():
+            yield Button("💾 Save", id="save", variant="success")
+            yield Button("❌ Cancel", id="cancel", variant="error")
 
-    if is_reconfigure:
-        console.print("[dim italic]Type 'exit' in Base URL to cancel.[/dim italic]\n")
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save":
+            base = self.query_one("#base_url", Input).value.strip()
+            model = self.query_one("#model", Input).value.strip()
+            token = self.query_one("#token", Input).value.strip()
+            if not base or not model:
+                self.query_one("#lbl-url").update("[red]Base URL: *required[/red]")
+                return
+            config = {"base_url": base, "model": model, "token": token}
+            save_config(config)
+            self.app.config = config
+            self.app.pop_screen()
+            self.app.query_one("#chat-input", Input).focus()
+        else:
+            self.app.pop_screen()
+            self.app.query_one("#chat-input", Input).focus()
 
-    base_url = Prompt.ask("[bold cyan]Base URL[/bold cyan]")
-    if is_reconfigure and base_url.strip().lower() == 'exit':
-        return load_config()
+class MessageUser(Static):
+    def __init__(self, text: str):
+        self.text = text
+        super().__init__()
 
-    model = Prompt.ask("[bold cyan]Model Name[/bold cyan]")
-    token = Prompt.ask("[bold cyan]Token/Key[/bold cyan]", password=True)
+    def render(self):
+        return Panel(self.text, style="bold cyan", border_style="cyan", title="[bold white]You[/bold white]", title_align="right")
 
-    config = {"base_url": base_url.strip(), "model": model.strip(), "token": token.strip()}
-    save_config(config)
-    console.print("\n[bold green]✅ Saved![/bold green]")
-    time.sleep(1)
-    return config
+class MessageAI(Static):
+    def __init__(self, text: str):
+        self.text = text
+        super().__init__()
 
-def update_app():
-    console.print("\n[bold cyan]🔄 Updating via GitHub...[/bold cyan]")
-    if os.path.exists(REPO_DIR):
-        try:
-            # Pura forcefully update karega, error nahi aayega ab
-            subprocess.run(["git", "-C", REPO_DIR, "fetch", "--all"], check=True)
-            subprocess.run(["git", "-C", REPO_DIR, "reset", "--hard", "origin/main"], check=True)
-            console.print("[bold green]✅ Update complete! Restarting...[/bold green]")
-            time.sleep(1)
-            os.execv(sys.executable, ['python3'] + sys.argv)
-        except subprocess.CalledProcessError:
-            console.print("[bold red]❌ Update failed. Please check repository.[/bold red]")
-            time.sleep(2)
-    else:
-        console.print("[bold red]❌ Repository not found. Cannot auto-update.[/bold red]")
-        time.sleep(2)
+    def render(self):
+        md = Markdown(self.text, code_theme="monokai")
+        return Panel(md, style="white", border_style="green", title="[bold cyan]Sinket[/bold cyan]", title_align="left")
 
-def print_header(config):
-    console.clear()
-    # Ekdum clean open code zen jaisa header
-    header_text = f"[bold white]# SINKET CLAWD Workspace[/bold white]   [dim]Model: {config.get('model')} | Commands: /provider, /update, /clear, /exit[/dim]"
-    console.print(Panel(header_text, border_style="dim cyan", padding=(0, 1)))
-    console.print("")
+class ThinkingIndicator(Static):
+    def render(self):
+        return Panel("● ● ●  thinking...", style="italic cyan", border_style="cyan")
 
-def chat_loop():
-    config = load_config()
-    if not config.get("base_url"):
-        config = setup_provider()
+class SinketApp(App):
+    CSS = ZEN_CSS
+    BINDINGS = [
+        Binding("ctrl+s", "setup", "Settings"),
+        Binding("ctrl+c", "quit", "Quit"),
+    ]
 
-    history = load_history()
-    print_header(config)
+    config = reactive(load_config())
+    history = reactive(load_history())
+    is_thinking = reactive(False)
 
-    if history:
-        console.print("[dim]Loading history...[/dim]\n")
-        for msg in history[-4:]:
-            if msg["role"] == "user":
-                console.print(f"[bold white]User[/bold white]")
-                console.print(f"[cyan]>[/cyan] {msg['content']}\n")
-            else:
-                console.print(f"[bold cyan]Sinket[/bold cyan]")
-                console.print(Markdown(msg['content']))
-                console.print("")
+    def compose(self) -> ComposeResult:
+        yield Static("⚡ SINKET CLAWD v2  —  Zen Edition", classes="title-bar")
+        yield Static(f"Model: {self.config.get('model','Not Set')}  |  Ctrl+S: Settings  |  /exit /clear /update /provider", classes="status-bar")
+        with VerticalScroll(id="chat-scroll", classes="chat-scroll"):
+            for msg in self.history[-20:]:
+                if msg["role"] == "user":
+                    yield MessageUser(msg["content"])
+                else:
+                    yield MessageAI(msg["content"])
+        yield ThinkingIndicator(id="thinking", classes="thinking-bubble")
+        yield Input(placeholder="❯  Type a message or /command …", id="chat-input")
 
-    while True:
-        # Minimalistic input block theme
-        console.print("[dim]┌─ Input[/dim]")
-        sys.stdout.write("\033[2m│\033[0m \033[1;36m❯\033[0m ")
-        sys.stdout.flush()
-        try:
-            user_input = input().strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\n")
-            break
-        console.print("[dim]└──────────────[/dim]")
+    def on_mount(self):
+        self.query_one("#thinking", ThinkingIndicator).display = False
+        self.query_one("#chat-input", Input).focus()
+        if not self.config.get("base_url"):
+            self.push_screen(SetupModal())
 
-        if not user_input:
-            continue
+    def action_setup(self):
+        self.push_screen(SetupModal())
 
-        cmd = user_input.lower()
+    def scroll_to_bottom(self):
+        scroll = self.query_one("#chat-scroll", VerticalScroll)
+        scroll.scroll_end(animate=False)
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        user_text = event.value.strip()
+        if not user_text:
+            return
+        self.query_one("#chat-input", Input).value = ""
+
+        cmd = user_text.lower()
+
         if cmd == "/exit":
-            break
+            self.exit()
+            return
         elif cmd == "/clear":
-            history = []
-            save_history(history)
-            print_header(config)
-            continue
+            self.history = []
+            save_history(self.history)
+            chat_scroll = self.query_one("#chat-scroll", VerticalScroll)
+            chat_scroll.remove_children()
+            return
         elif cmd == "/provider":
-            new_config = setup_provider(is_reconfigure=True)
-            if new_config:
-                config = new_config
-            print_header(config)
-            continue
+            self.push_screen(SetupModal())
+            return
         elif cmd == "/update":
-            update_app()
-            continue
+            await self.do_update()
+            return
 
-        history.append({"role": "user", "content": user_input})
-        save_history(history)
+        # Add user message
+        self.history.append({"role": "user", "content": user_text})
+        save_history(self.history)
+        chat_scroll = self.query_one("#chat-scroll", VerticalScroll)
+        await chat_scroll.mount(MessageUser(user_text))
+        self.scroll_to_bottom()
 
-        endpoint = config["base_url"]
+        # Show thinking
+        self.is_thinking = True
+        thinking = self.query_one("#thinking", ThinkingIndicator)
+        thinking.display = True
+        self.scroll_to_bottom()
+
+        # Call API in background
+        reply = await self.call_api()
+
+        # Hide thinking
+        thinking.display = False
+        self.is_thinking = False
+
+        if reply:
+            # Typewriter effect
+            ai_msg = MessageAI("")
+            await chat_scroll.mount(ai_msg)
+            self.scroll_to_bottom()
+
+            words = reply.split(" ")
+            displayed = ""
+            for i, word in enumerate(words):
+                displayed += word + (" " if i < len(words) - 1 else "")
+                ai_msg.text = displayed
+                ai_msg.refresh()
+                self.scroll_to_bottom()
+                await self.sleep(0.015)
+
+            self.history.append({"role": "assistant", "content": reply})
+            save_history(self.history)
+
+    async def call_api(self):
+        if not self.config.get("base_url"):
+            return "❌ No API configured. Press Ctrl+S to setup."
+
+        endpoint = self.config["base_url"]
         if not endpoint.endswith("/chat/completions"):
             endpoint = endpoint.rstrip("/") + "/chat/completions"
 
         req_data = json.dumps({
-            "model": config["model"],
-            "messages": history
+            "model": self.config["model"],
+            "messages": self.history
         }).encode('utf-8')
 
         headers = {"Content-Type": "application/json"}
-        if config.get("token"):
-            headers["Authorization"] = f"Bearer {config['token']}"
+        if self.config.get("token"):
+            headers["Authorization"] = f"Bearer {self.config['token']}"
 
         req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
 
-        reply = ""
-        console.print("")
-        with console.status("[cyan]Thinking...[/cyan]", spinner="dots", spinner_style="cyan"):
-            try:
-                resp = urllib.request.urlopen(req, timeout=120)
-                resp_data = json.loads(resp.read().decode('utf-8'))
-                reply = resp_data["choices"][0]["message"]["content"]
-            except HTTPError as e:
-                err_body = e.read().decode('utf-8')
-                reply = f"❌ API Error {e.code}: {err_body}"
-                console.print(f"[bold red]{reply}[/bold red]")
-                history.pop()
-                continue
-            except Exception as e:
-                reply = f"❌ Error: {str(e)}"
-                console.print(f"[bold red]{reply}[/bold red]")
-                history.pop()
-                continue
+        try:
+            loop = asyncio.get_event_loop()
+            resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=120))
+            resp_data = json.loads(resp.read().decode('utf-8'))
+            return resp_data["choices"][0]["message"]["content"]
+        except HTTPError as e:
+            return f"❌ API Error {e.code}: {e.read().decode('utf-8')[:200]}"
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
 
-        console.print("[bold cyan]Sinket[/bold cyan]")
-        words = reply.split(" ")
-        displayed = ""
-        
-        with Live(console=console, auto_refresh=False, vertical_overflow="visible") as live:
-            for i, word in enumerate(words):
-                displayed += word + (" " if i < len(words) - 1 else "")
-                live.update(Markdown(displayed), refresh=True)
-                time.sleep(0.015) 
-        
-        console.print("\n") 
-        history.append({"role": "assistant", "content": reply})
-        save_history(history)
+    async def do_update(self):
+        chat_scroll = self.query_one("#chat-scroll", VerticalScroll)
+        await chat_scroll.mount(MessageAI("🔄 Updating via GitHub..."))
+        self.scroll_to_bottom()
+
+        if not os.path.exists(REPO_DIR):
+            await chat_scroll.mount(MessageAI("❌ Repository not found."))
+            return
+
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: subprocess.run(["git", "-C", REPO_DIR, "fetch", "--all"], check=True, capture_output=True))
+            await loop.run_in_executor(None, lambda: subprocess.run(["git", "-C", REPO_DIR, "reset", "--hard", "origin/main"], check=True, capture_output=True))
+            await chat_scroll.mount(MessageAI("✅ Update complete! Restarting..."))
+            await self.sleep(1)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            await chat_scroll.mount(MessageAI(f"❌ Update failed: {str(e)}"))
+
+    async def sleep(self, seconds: float):
+        import asyncio
+        await asyncio.sleep(seconds)
 
 if __name__ == "__main__":
-    chat_loop()
+    import asyncio
+    app = SinketApp()
+    app.run()
