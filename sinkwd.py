@@ -30,13 +30,6 @@ ASCII_ART = """[bold cyan]
 ╚════██║██║██║╚██╗██║██╔═██╗ ██╔══╝     ██║   
 ███████║██║██║ ╚████║██║  ██╗███████╗   ██║   
 ╚══════╝╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝   ╚═╝   
-                                              
- ██████╗██╗      █████╗ ██╗    ██╗██████╗ 
-██╔════╝██║     ██╔══██╗██║    ██║██╔══██╗
-██║     ██║     ███████║██║ █╗ ██║██║  ██║
-██║     ██║     ██╔══██║██║███╗██║██║  ██║
-╚██████╗███████╗██║  ██║╚███╔███╔╝██████╔╝
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═════╝ 
 [/bold cyan]"""
 
 def load_config():
@@ -62,44 +55,47 @@ def save_history(history):
 def setup_provider(is_reconfigure=False):
     console.clear()
     console.print(ASCII_ART, justify="center")
-    console.print(Panel("[bold cyan]WELCOME TO SINKET CLAWD SETUP[/bold cyan]\n[dim]Configure ANY OpenAI-compatible API Provider.[/dim]", border_style="cyan"))
+    console.print(Panel("[bold cyan]SETUP[/bold cyan]\n[dim]Configure API Provider.[/dim]", border_style="cyan"))
 
     if is_reconfigure:
-        console.print("[dim italic]Type 'exit' in Base URL to cancel and return to chat.[/dim italic]\n")
+        console.print("[dim italic]Type 'exit' in Base URL to cancel.[/dim italic]\n")
 
-    base_url = Prompt.ask("[bold cyan]Enter API Base URL[/bold cyan] [dim](e.g., https://api.openai.com/v1)[/dim]")
+    base_url = Prompt.ask("[bold cyan]Base URL[/bold cyan]")
     if is_reconfigure and base_url.strip().lower() == 'exit':
         return load_config()
 
-    model = Prompt.ask("[bold cyan]Enter Model Name[/bold cyan] [dim](e.g., gpt-4, claude-3)[/dim]")
-    token = Prompt.ask("[bold cyan]Enter API Token/Key[/bold cyan] [dim](Leave blank if none required)[/dim]", password=True)
+    model = Prompt.ask("[bold cyan]Model Name[/bold cyan]")
+    token = Prompt.ask("[bold cyan]Token/Key[/bold cyan]", password=True)
 
     config = {"base_url": base_url.strip(), "model": model.strip(), "token": token.strip()}
     save_config(config)
-    console.print("\n[bold green]✅ Setup Saved Successfully! Booting Sinket Clawd...[/bold green]")
-    time.sleep(1.5)
+    console.print("\n[bold green]✅ Saved![/bold green]")
+    time.sleep(1)
     return config
 
 def update_app():
-    console.print("\n[bold cyan]🔄 Updating Sinket Clawd via GitHub...[/bold cyan]")
+    console.print("\n[bold cyan]🔄 Updating via GitHub...[/bold cyan]")
     if os.path.exists(REPO_DIR):
         try:
-            subprocess.run(["git", "-C", REPO_DIR, "pull", "origin", "main"], check=True)
+            # Pura forcefully update karega, error nahi aayega ab
+            subprocess.run(["git", "-C", REPO_DIR, "fetch", "--all"], check=True)
+            subprocess.run(["git", "-C", REPO_DIR, "reset", "--hard", "origin/main"], check=True)
             console.print("[bold green]✅ Update complete! Restarting...[/bold green]")
             time.sleep(1)
             os.execv(sys.executable, ['python3'] + sys.argv)
         except subprocess.CalledProcessError:
-            console.print("[bold red]❌ Failed to update. Please check git repository.[/bold red]")
+            console.print("[bold red]❌ Update failed. Please check repository.[/bold red]")
             time.sleep(2)
     else:
-        console.print("[bold red]❌ Repository directory not found. Cannot auto-update.[/bold red]")
+        console.print("[bold red]❌ Repository not found. Cannot auto-update.[/bold red]")
         time.sleep(2)
 
 def print_header(config):
     console.clear()
-    console.print(ASCII_ART, justify="center")
-    header_text = f"[bold cyan]Model:[/bold cyan] {config.get('model')} | [bold cyan]Commands:[/bold cyan] /provider, /update, /clear, /exit"
-    console.print(Panel(header_text, border_style="cyan", padding=(0, 2)))
+    # Ekdum clean open code zen jaisa header
+    header_text = f"[bold white]# SINKET CLAWD Workspace[/bold white]   [dim]Model: {config.get('model')} | Commands: /provider, /update, /clear, /exit[/dim]"
+    console.print(Panel(header_text, border_style="dim cyan", padding=(0, 1)))
+    console.print("")
 
 def chat_loop():
     config = load_config()
@@ -109,44 +105,39 @@ def chat_loop():
     history = load_history()
     print_header(config)
 
-    # Show last few messages for context seamlessly
     if history:
-        console.print("[dim cyan]Loading previous messages...[/dim cyan]\n")
+        console.print("[dim]Loading history...[/dim]\n")
         for msg in history[-4:]:
             if msg["role"] == "user":
-                console.print(f"[bold cyan]╭─ YOU[/bold cyan]")
-                console.print(f"[bold cyan]╰─❯[/bold cyan] {msg['content']}\n")
+                console.print(f"[bold white]User[/bold white]")
+                console.print(f"[cyan]>[/cyan] {msg['content']}\n")
             else:
-                console.print(f"[bold white]╭─ SINKET[/bold white]")
+                console.print(f"[bold cyan]Sinket[/bold cyan]")
                 console.print(Markdown(msg['content']))
                 console.print("")
 
     while True:
-        console.print("[dim cyan]─[/dim cyan]" * 40)
-        console.print("[bold cyan]╭─ YOU[/bold cyan]")
+        # Minimalistic input block theme
+        console.print("[dim]┌─ Input[/dim]")
+        sys.stdout.write("\033[2m│\033[0m \033[1;36m❯\033[0m ")
+        sys.stdout.flush()
         try:
-            # Custom input prompt for a slicker UI
-            sys.stdout.write("\033[1;36m╰─❯\033[0m ")
-            sys.stdout.flush()
             user_input = input().strip()
-            print() 
         except (KeyboardInterrupt, EOFError):
             print("\n")
-            console.print("[bold cyan]👋 Bye! Session ended.[/bold cyan]")
             break
+        console.print("[dim]└──────────────[/dim]")
 
         if not user_input:
             continue
 
         cmd = user_input.lower()
         if cmd == "/exit":
-            console.print("[bold cyan]👋 Bye! Session ended.[/bold cyan]")
             break
         elif cmd == "/clear":
             history = []
             save_history(history)
             print_header(config)
-            console.print("[dim cyan]✨ Memory cleared. Starting fresh![/dim cyan]\n")
             continue
         elif cmd == "/provider":
             new_config = setup_provider(is_reconfigure=True)
@@ -177,8 +168,8 @@ def chat_loop():
         req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
 
         reply = ""
-        # New modern bouncing bar spinner
-        with console.status("[bold cyan]SINKET is thinking...[/bold cyan]", spinner="bouncingBar", spinner_style="cyan"):
+        console.print("")
+        with console.status("[cyan]Thinking...[/cyan]", spinner="dots", spinner_style="cyan"):
             try:
                 resp = urllib.request.urlopen(req, timeout=120)
                 resp_data = json.loads(resp.read().decode('utf-8'))
@@ -195,20 +186,17 @@ def chat_loop():
                 history.pop()
                 continue
 
-        # LIVE TYPING ANIMATION (Token by Token)
-        console.print("[bold white]╭─ SINKET[/bold white]")
+        console.print("[bold cyan]Sinket[/bold cyan]")
         words = reply.split(" ")
         displayed = ""
         
         with Live(console=console, auto_refresh=False, vertical_overflow="visible") as live:
             for i, word in enumerate(words):
                 displayed += word + (" " if i < len(words) - 1 else "")
-                # Live Markdown rendering during typing!
                 live.update(Markdown(displayed), refresh=True)
-                # Adjust speed here if needed (0.015 is perfectly balanced)
                 time.sleep(0.015) 
         
-        console.print("") 
+        console.print("\n") 
         history.append({"role": "assistant", "content": reply})
         save_history(history)
 
