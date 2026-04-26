@@ -7,7 +7,6 @@ import subprocess
 import urllib.request
 from urllib.error import HTTPError
 import asyncio
-import threading
 import queue as thread_queue
 
 # ─── Auto-install dependencies ───
@@ -40,8 +39,6 @@ REPO_DIR = os.path.expanduser("~/.sinket_clawd")
 ZEN_CSS = """
 Screen { align: center middle; background: #0d1117; }
 
-.main-container { width: 100%; height: 100%; background: #0d1117; }
-
 .status-bar { 
     height: 1; 
     background: #0d1117; 
@@ -55,6 +52,8 @@ Screen { align: center middle; background: #0d1117; }
     height: 1fr; 
     background: #0d1117; 
     padding: 0 1;
+    scrollbar-background: #161b22;
+    scrollbar-color: #39c5cf;
 }
 
 .message-user { 
@@ -169,7 +168,6 @@ def save_history(history):
 
 # ─── SSE PARSER ───
 def parse_sse_line(line):
-    """Parse SSE line. Returns (content_chunk, is_done, error)"""
     line = line.strip()
     if not line:
         return "", False, None
@@ -296,6 +294,12 @@ class SinketApp(App):
         Binding("ctrl+s", "setup", "⚙️ Settings"),
         Binding("ctrl+l", "clear", "🧹 Clear"),
         Binding("ctrl+q", "quit", "❌ Exit"),
+        # ─── SCROLL KEYS (Globally active) ───
+        Binding("up", "scroll_up", "↑", show=False),
+        Binding("down", "scroll_down", "↓", show=False),
+        Binding("pageup", "scroll_page_up", "PgUp", show=False),
+        Binding("pagedown", "scroll_page_down", "PgDn", show=False),
+        Binding("ctrl+end", "scroll_bottom", "End", show=False),
     ]
 
     config = reactive(load_config())
@@ -305,7 +309,7 @@ class SinketApp(App):
     def compose(self) -> ComposeResult:
         model_name = self.config.get("model", "Not Set")
         status = "[green]●[/green]" if self.config.get("base_url") else "[red]●[/red]"
-        yield Static(f"  [bold cyan]SINKET CLAWD v2[/bold cyan] [dim]|[/dim] Model: [cyan]{model_name}[/cyan] {status} [dim]| Ctrl+S Settings | Ctrl+L Clear | Ctrl+Q Exit[/dim]", classes="status-bar")
+        yield Static(f"  [bold cyan]SINKET CLAWD v2[/bold cyan] [dim]|[/dim] Model: [cyan]{model_name}[/cyan] {status} [dim]| ↑↓ Scroll | PgUp/PgDn | Ctrl+End Bottom | Ctrl+S Settings | Ctrl+Q Exit[/dim]", classes="status-bar")
         
         with VerticalScroll(id="chat-scroll", classes="chat-scroll"):
             for msg in self.history[-30:]:
@@ -325,11 +329,27 @@ class SinketApp(App):
         if not self.config.get("base_url"):
             self.push_screen(SetupModal())
 
+    # ─── SCROLL ACTIONS ───
+    def action_scroll_up(self):
+        self.query_one("#chat-scroll", VerticalScroll).scroll_up()
+
+    def action_scroll_down(self):
+        self.query_one("#chat-scroll", VerticalScroll).scroll_down()
+
+    def action_scroll_page_up(self):
+        self.query_one("#chat-scroll", VerticalScroll).scroll_page_up()
+
+    def action_scroll_page_down(self):
+        self.query_one("#chat-scroll", VerticalScroll).scroll_page_down()
+
+    def action_scroll_bottom(self):
+        self.query_one("#chat-scroll", VerticalScroll).scroll_end(animate=False)
+
     def update_status(self):
         model_name = self.config.get("model", "Not Set")
         status = "[green]●[/green]" if self.config.get("base_url") else "[red]●[/red]"
         self.query_one(".status-bar", Static).update(
-            f"  [bold cyan]SINKET CLAWD v2[/bold cyan] [dim]|[/dim] Model: [cyan]{model_name}[/cyan] {status} [dim]| Ctrl+S Settings | Ctrl+L Clear | Ctrl+Q Exit[/dim]"
+            f"  [bold cyan]SINKET CLAWD v2[/bold cyan] [dim]|[/dim] Model: [cyan]{model_name}[/cyan] {status} [dim]| ↑↓ Scroll | PgUp/PgDn | Ctrl+End Bottom | Ctrl+S Settings | Ctrl+Q Exit[/dim]"
         )
 
     def action_setup(self):
@@ -394,7 +414,6 @@ class SinketApp(App):
             thinking.display = True
             reply = await self.call_api_non_streaming()
             if reply:
-                # Typewriter effect for non-streaming fallback
                 words = reply.split(" ")
                 displayed = ""
                 for i, word in enumerate(words):
@@ -415,7 +434,6 @@ class SinketApp(App):
     # STREAMING API (DEFAULT — chunks in real-time)
     # ═══════════════════════════════════════════════════════
     async def call_api_streaming(self, ai_msg):
-        """Returns full reply string, or None if fallback needed"""
         if not self.config.get("base_url"):
             return None
 
@@ -426,7 +444,7 @@ class SinketApp(App):
         req_data = json.dumps({
             "model": self.config["model"],
             "messages": self.history,
-            "stream": True  # ← DEFAULT STREAMING ON
+            "stream": True
         }).encode('utf-8')
 
         headers = {"Content-Type": "application/json"}
@@ -435,7 +453,6 @@ class SinketApp(App):
 
         req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
 
-        # Thread-safe queue for SSE chunks
         q = thread_queue.Queue()
         full_reply = ""
         fallback_needed = False
@@ -444,11 +461,9 @@ class SinketApp(App):
             nonlocal fallback_needed
             try:
                 resp = urllib.request.urlopen(req, timeout=120)
-                
                 for raw_line in resp:
                     line = raw_line.decode('utf-8')
                     content, done, error = parse_sse_line(line)
-                    
                     if error:
                         q.put(("error", error))
                         return
@@ -457,21 +472,17 @@ class SinketApp(App):
                         return
                     if content:
                         q.put(("chunk", content))
-                        
             except HTTPError as e:
                 err_body = e.read().decode('utf-8')
-                # If stream not supported, signal fallback
                 if e.code == 400 or "stream" in err_body.lower() or "not supported" in err_body.lower():
                     fallback_needed = True
                 q.put(("http_error", f"{e.code}:{err_body[:300]}"))
             except Exception as e:
                 q.put(("error", str(e)))
 
-        # Start reader thread
         loop = asyncio.get_event_loop()
         reader_future = loop.run_in_executor(None, read_sse_stream)
 
-        # Consume chunks in real-time
         try:
             while True:
                 try:
@@ -488,14 +499,14 @@ class SinketApp(App):
                     ai_msg.msg_text = full_reply
                     ai_msg.refresh()
                     self.scroll_to_bottom()
-                    await self.sleep(0.008)  # Smooth 8ms per chunk
+                    await self.sleep(0.008)
 
                 elif msg_type == "done":
                     return full_reply
 
                 elif msg_type == "http_error":
                     if fallback_needed:
-                        return None  # Signal fallback to non-streaming
+                        return None
                     code, body = data.split(":", 1)
                     ai_msg.msg_text = f"❌ [bold red]API Error {code}[/bold red]: {body[:200]}"
                     ai_msg.refresh()
@@ -515,7 +526,6 @@ class SinketApp(App):
     # NON-STREAMING API (FALLBACK — 120s timeout)
     # ═══════════════════════════════════════════════════════
     async def call_api_non_streaming(self):
-        """Fallback when streaming fails"""
         if not self.config.get("base_url"):
             return "❌ No API configured. Press [bold]Ctrl+S[/bold] to setup."
 
@@ -526,7 +536,7 @@ class SinketApp(App):
         req_data = json.dumps({
             "model": self.config["model"],
             "messages": self.history,
-            "stream": False  # ← Non-streaming fallback
+            "stream": False
         }).encode('utf-8')
 
         headers = {"Content-Type": "application/json"}
