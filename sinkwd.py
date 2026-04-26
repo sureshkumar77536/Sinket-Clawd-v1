@@ -6,6 +6,9 @@ import time
 import subprocess
 import urllib.request
 from urllib.error import HTTPError
+import asyncio
+import threading
+import queue as thread_queue
 
 # ─── Auto-install dependencies ───
 def ensure_deps():
@@ -28,7 +31,6 @@ from textual.reactive import reactive
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
-from rich.console import Console
 
 CONFIG_PATH = os.path.expanduser("~/.sinket_config.json")
 HISTORY_PATH = os.path.expanduser("~/.sinket_history.json")
@@ -40,18 +42,6 @@ Screen { align: center middle; background: #0d1117; }
 
 .main-container { width: 100%; height: 100%; background: #0d1117; }
 
-/* Header Bar */
-.header-bar { 
-    height: 3; 
-    background: #161b22; 
-    color: #39c5cf; 
-    content-align: center middle;
-    text-style: bold;
-    border: solid #30363d;
-    border-title-color: #39c5cf;
-}
-
-/* Status Bar */
 .status-bar { 
     height: 1; 
     background: #0d1117; 
@@ -60,7 +50,6 @@ Screen { align: center middle; background: #0d1117; }
     text-style: dim;
 }
 
-/* Chat Area */
 .chat-scroll { 
     width: 100%; 
     height: 1fr; 
@@ -68,7 +57,6 @@ Screen { align: center middle; background: #0d1117; }
     padding: 0 1;
 }
 
-/* User Message Bubble */
 .message-user { 
     width: 100%; 
     height: auto; 
@@ -79,7 +67,6 @@ Screen { align: center middle; background: #0d1117; }
     border-left: outer #39c5cf;
 }
 
-/* AI Message Bubble */
 .message-ai { 
     width: 100%; 
     height: auto; 
@@ -90,7 +77,6 @@ Screen { align: center middle; background: #0d1117; }
     border-left: outer #238636;
 }
 
-/* Thinking Indicator */
 .thinking-box { 
     width: 100%; 
     height: auto; 
@@ -102,7 +88,6 @@ Screen { align: center middle; background: #0d1117; }
     text-style: italic blink;
 }
 
-/* Input Area */
 .input-row { 
     height: auto; 
     background: #161b22; 
@@ -121,7 +106,6 @@ Input:focus {
     border: none; 
 }
 
-/* Setup Modal */
 .setup-modal { 
     background: #161b22; 
     color: #c9d1d9; 
@@ -183,16 +167,28 @@ def save_history(history):
     with open(HISTORY_PATH, "w") as f:
         json.dump(history[-100:], f)
 
-# ─── UI WIDGETS ───
+# ─── SSE PARSER ───
+def parse_sse_line(line):
+    """Parse SSE line. Returns (content_chunk, is_done, error)"""
+    line = line.strip()
+    if not line:
+        return "", False, None
+    if line.startswith("data: "):
+        data = line[6:]
+        if data == "[DONE]":
+            return None, True, None
+        try:
+            obj = json.loads(data)
+            choices = obj.get("choices", [{}])
+            if choices:
+                delta = choices[0].get("delta", {})
+                content = delta.get("content", "")
+                return content, False, None
+        except json.JSONDecodeError:
+            pass
+    return "", False, None
 
-class ZenHeader(Static):
-    def render(self):
-        return Panel.fit(
-            "[bold cyan]⚡ SINKET CLAWD v2[/bold cyan] [dim]—[/dim] [bold green]Zen Edition[/bold green]",
-            style="cyan",
-            border_style="cyan",
-            padding=(0, 2)
-        )
+# ─── UI WIDGETS ───
 
 class MessageUser(Static):
     def __init__(self, text: str):
@@ -200,7 +196,6 @@ class MessageUser(Static):
         super().__init__()
 
     def render(self):
-        # User message with cyan styling
         content = Text(self.msg_text, style="bold cyan")
         return Panel(
             content,
@@ -219,7 +214,6 @@ class MessageAI(Static):
     def render(self):
         if not self.msg_text:
             return Panel("", border_style="green")
-        # AI message with markdown + code highlighting
         md = Markdown(self.msg_text, code_theme="monokai")
         return Panel(
             md,
@@ -258,7 +252,7 @@ class ThinkingIndicator(Static):
 
 class SetupModal(Container):
     def compose(self) -> ComposeResult:
-        yield ZenHeader()
+        yield Static("⚡ [bold cyan]SINKET CLAWD v2[/bold cyan] [dim]—[/dim] [bold green]Zen Edition[/bold green]", classes="status-bar")
         yield Label("🔧 [bold cyan]API Provider Setup[/bold cyan]", id="setup-title")
         yield Label("Base URL:", id="lbl-url")
         yield Input(placeholder="https://api.openai.com/v1", id="base_url", value=load_config().get("base_url", ""))
@@ -309,12 +303,10 @@ class SinketApp(App):
     is_thinking = reactive(False)
 
     def compose(self) -> ComposeResult:
-        # Top Status Bar
         model_name = self.config.get("model", "Not Set")
         status = "[green]●[/green]" if self.config.get("base_url") else "[red]●[/red]"
         yield Static(f"  [bold cyan]SINKET CLAWD v2[/bold cyan] [dim]|[/dim] Model: [cyan]{model_name}[/cyan] {status} [dim]| Ctrl+S Settings | Ctrl+L Clear | Ctrl+Q Exit[/dim]", classes="status-bar")
         
-        # Chat Messages Area
         with VerticalScroll(id="chat-scroll", classes="chat-scroll"):
             for msg in self.history[-30:]:
                 if msg["role"] == "user":
@@ -322,10 +314,8 @@ class SinketApp(App):
                 else:
                     yield MessageAI(msg["content"])
         
-        # Thinking Indicator (hidden by default)
         yield ThinkingIndicator(id="thinking")
         
-        # Input Area
         with Container(classes="input-row"):
             yield Input(placeholder="❯  Type message or /command …", id="chat-input")
 
@@ -377,7 +367,7 @@ class SinketApp(App):
             await self.do_update()
             return
 
-        # Add user message to UI
+        # Add user message
         self.history.append({"role": "user", "content": user_text})
         save_history(self.history)
         
@@ -385,38 +375,147 @@ class SinketApp(App):
         await chat_scroll.mount(MessageUser(user_text))
         self.scroll_to_bottom()
 
-        # Show thinking animation
+        # Show thinking
         self.is_thinking = True
         thinking = self.query_one("#thinking", ThinkingIndicator)
         thinking.display = True
         self.scroll_to_bottom()
 
-        # Call API
-        reply = await self.call_api()
+        # Create empty AI message for streaming
+        ai_msg = MessageAI("")
+        await chat_scroll.mount(ai_msg)
+        self.scroll_to_bottom()
 
-        # Hide thinking
+        # ─── TRY STREAMING FIRST ───
+        reply = await self.call_api_streaming(ai_msg)
+        
+        # ─── FALLBACK TO NON-STREAMING ───
+        if reply is None:
+            thinking.display = True
+            reply = await self.call_api_non_streaming()
+            if reply:
+                # Typewriter effect for non-streaming fallback
+                words = reply.split(" ")
+                displayed = ""
+                for i, word in enumerate(words):
+                    displayed += word + (" " if i < len(words) - 1 else "")
+                    ai_msg.msg_text = displayed
+                    ai_msg.refresh()
+                    self.scroll_to_bottom()
+                    await self.sleep(0.012)
+        
         thinking.display = False
         self.is_thinking = False
 
         if reply:
-            # Typewriter effect with smooth reveal
-            ai_msg = MessageAI("")
-            await chat_scroll.mount(ai_msg)
-            self.scroll_to_bottom()
-
-            words = reply.split(" ")
-            displayed = ""
-            for i, word in enumerate(words):
-                displayed += word + (" " if i < len(words) - 1 else "")
-                ai_msg.msg_text = displayed
-                ai_msg.refresh()
-                self.scroll_to_bottom()
-                await self.sleep(0.012)  # Smooth 12ms per word
-
             self.history.append({"role": "assistant", "content": reply})
             save_history(self.history)
 
-    async def call_api(self):
+    # ═══════════════════════════════════════════════════════
+    # STREAMING API (DEFAULT — chunks in real-time)
+    # ═══════════════════════════════════════════════════════
+    async def call_api_streaming(self, ai_msg):
+        """Returns full reply string, or None if fallback needed"""
+        if not self.config.get("base_url"):
+            return None
+
+        endpoint = self.config["base_url"]
+        if not endpoint.endswith("/chat/completions"):
+            endpoint = endpoint.rstrip("/") + "/chat/completions"
+
+        req_data = json.dumps({
+            "model": self.config["model"],
+            "messages": self.history,
+            "stream": True  # ← DEFAULT STREAMING ON
+        }).encode('utf-8')
+
+        headers = {"Content-Type": "application/json"}
+        if self.config.get("token"):
+            headers["Authorization"] = f"Bearer {self.config['token']}"
+
+        req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
+
+        # Thread-safe queue for SSE chunks
+        q = thread_queue.Queue()
+        full_reply = ""
+        fallback_needed = False
+
+        def read_sse_stream():
+            nonlocal fallback_needed
+            try:
+                resp = urllib.request.urlopen(req, timeout=120)
+                
+                for raw_line in resp:
+                    line = raw_line.decode('utf-8')
+                    content, done, error = parse_sse_line(line)
+                    
+                    if error:
+                        q.put(("error", error))
+                        return
+                    if done:
+                        q.put(("done", None))
+                        return
+                    if content:
+                        q.put(("chunk", content))
+                        
+            except HTTPError as e:
+                err_body = e.read().decode('utf-8')
+                # If stream not supported, signal fallback
+                if e.code == 400 or "stream" in err_body.lower() or "not supported" in err_body.lower():
+                    fallback_needed = True
+                q.put(("http_error", f"{e.code}:{err_body[:300]}"))
+            except Exception as e:
+                q.put(("error", str(e)))
+
+        # Start reader thread
+        loop = asyncio.get_event_loop()
+        reader_future = loop.run_in_executor(None, read_sse_stream)
+
+        # Consume chunks in real-time
+        try:
+            while True:
+                try:
+                    msg_type, data = await asyncio.wait_for(
+                        loop.run_in_executor(None, q.get), timeout=120
+                    )
+                except asyncio.TimeoutError:
+                    ai_msg.msg_text = "❌ [bold red]Stream timeout after 120s[/bold red]"
+                    ai_msg.refresh()
+                    return None
+
+                if msg_type == "chunk":
+                    full_reply += data
+                    ai_msg.msg_text = full_reply
+                    ai_msg.refresh()
+                    self.scroll_to_bottom()
+                    await self.sleep(0.008)  # Smooth 8ms per chunk
+
+                elif msg_type == "done":
+                    return full_reply
+
+                elif msg_type == "http_error":
+                    if fallback_needed:
+                        return None  # Signal fallback to non-streaming
+                    code, body = data.split(":", 1)
+                    ai_msg.msg_text = f"❌ [bold red]API Error {code}[/bold red]: {body[:200]}"
+                    ai_msg.refresh()
+                    return None
+
+                elif msg_type == "error":
+                    ai_msg.msg_text = f"❌ [bold red]Error:[/bold red] {data[:200]}"
+                    ai_msg.refresh()
+                    return None
+
+        except Exception as e:
+            ai_msg.msg_text = f"❌ [bold red]Stream failed:[/bold red] {str(e)}"
+            ai_msg.refresh()
+            return None
+
+    # ═══════════════════════════════════════════════════════
+    # NON-STREAMING API (FALLBACK — 120s timeout)
+    # ═══════════════════════════════════════════════════════
+    async def call_api_non_streaming(self):
+        """Fallback when streaming fails"""
         if not self.config.get("base_url"):
             return "❌ No API configured. Press [bold]Ctrl+S[/bold] to setup."
 
@@ -426,7 +525,8 @@ class SinketApp(App):
 
         req_data = json.dumps({
             "model": self.config["model"],
-            "messages": self.history
+            "messages": self.history,
+            "stream": False  # ← Non-streaming fallback
         }).encode('utf-8')
 
         headers = {"Content-Type": "application/json"}
@@ -436,14 +536,15 @@ class SinketApp(App):
         req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
 
         try:
-            import asyncio
             loop = asyncio.get_event_loop()
-            resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=120))
+            resp = await loop.run_in_executor(
+                None, 
+                lambda: urllib.request.urlopen(req, timeout=120)
+            )
             resp_data = json.loads(resp.read().decode('utf-8'))
             return resp_data["choices"][0]["message"]["content"]
         except HTTPError as e:
-            err = e.read().decode('utf-8')[:300]
-            return f"❌ [bold red]API Error {e.code}[/bold red]: {err}"
+            return f"❌ [bold red]API Error {e.code}[/bold red]: {e.read().decode('utf-8')[:200]}"
         except Exception as e:
             return f"❌ [bold red]Error:[/bold red] {str(e)}"
 
@@ -457,7 +558,6 @@ class SinketApp(App):
             return
 
         try:
-            import asyncio
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda: subprocess.run(
                 ["git", "-C", REPO_DIR, "fetch", "--all"], 
@@ -474,7 +574,6 @@ class SinketApp(App):
             await chat_scroll.mount(MessageAI(f"❌ [bold red]Update failed:[/bold red] {str(e)}"))
 
     async def sleep(self, seconds: float):
-        import asyncio
         await asyncio.sleep(seconds)
 
 if __name__ == "__main__":
